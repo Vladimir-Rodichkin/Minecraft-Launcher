@@ -40,14 +40,22 @@ def load_nicknames():
         return []
 
 
-def save_nickname(name):
-    nicknames = [n for n in load_nicknames() if n != name]
-    nicknames.insert(0, name)
-    nicknames = nicknames[:MAX_SAVED_NICKNAMES]
+def write_nicknames(nicknames):
     os.makedirs(MINECRAFT_DIR, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump({"nicknames": nicknames}, f, ensure_ascii=False, indent=2)
     return nicknames
+
+
+def save_nickname(name):
+    nicknames = [n for n in load_nicknames() if n != name]
+    nicknames.insert(0, name)
+    return write_nicknames(nicknames[:MAX_SAVED_NICKNAMES])
+
+
+def delete_nickname(name):
+    write_nicknames([n for n in load_nicknames() if n != name])
+    render_nickname_list()
 
 
 def format_date(value):
@@ -115,12 +123,21 @@ def select_nickname(name):
 def build_nickname_row(name):
     row = ctk.CTkFrame(nickname_list_frame, fg_color="#1a1d1f", corner_radius=8, border_width=2, border_color="#1a1d1f")
     color = ICON_COLORS[hash(name) % len(ICON_COLORS)]
-    ctk.CTkLabel(row, text=name[:1].upper(), width=22, height=22, corner_radius=11, fg_color=color, font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, padx=(8, 8), pady=6)
-    ctk.CTkLabel(row, text=name, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew")
+    icon_label = ctk.CTkLabel(row, text=name[:1].upper(), width=22, height=22, corner_radius=11, fg_color=color, font=ctk.CTkFont(size=11, weight="bold"))
+    icon_label.grid(row=0, column=0, padx=(8, 8), pady=6)
+    name_label = ctk.CTkLabel(row, text=name, font=ctk.CTkFont(size=13, weight="bold"), anchor="w")
+    name_label.grid(row=0, column=1, sticky="ew")
     row.grid_columnconfigure(1, weight=1, minsize=50)
-    for widget in row.winfo_children():
+
+    for widget in (row, icon_label, name_label):
         widget.bind("<Button-1>", lambda _e, n=name: select_nickname(n))
-    row.bind("<Button-1>", lambda _e, n=name: select_nickname(n))
+
+    delete_button = ctk.CTkButton(
+        row, text="✕", width=24, height=24, fg_color="transparent",
+        text_color="#9a9a9a", hover_color="#3a1f1f",
+        command=lambda n=name: delete_nickname(n),
+    )
+    delete_button.grid(row=0, column=2, padx=(0, 8))
     return row
 
 def render_nickname_list():
