@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import threading
@@ -7,7 +8,9 @@ import customtkinter as ctk
 import minecraft_launcher_lib as mll
 
 MINECRAFT_DIR = os.path.join(os.environ["APPDATA"], ".simple_mc_launcher")
+CONFIG_PATH = os.path.join(MINECRAFT_DIR, "config.json")
 PAGE_SIZE = 3
+MAX_SAVED_NICKNAMES = 8
 
 ACCENT = "#3b82f6"
 ACCENT_HOVER = "#2f6fd1"
@@ -27,6 +30,24 @@ current_page = 0
 total_pages = 1
 selected_version = None
 version_rows = {}
+
+
+def load_nicknames():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f).get("nicknames", [])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_nickname(name):
+    nicknames = [n for n in load_nicknames() if n != name]
+    nicknames.insert(0, name)
+    nicknames = nicknames[:MAX_SAVED_NICKNAMES]
+    os.makedirs(MINECRAFT_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"nicknames": nicknames}, f, ensure_ascii=False, indent=2)
+    return nicknames
 
 
 def format_date(value):
@@ -50,6 +71,7 @@ def launch_game():
     version = selected_version
 
     root.after(0, lambda: play_button.configure(state="disabled", text="Запуск..."))
+    save_nickname(username)
 
     try:
         if not is_installed(version):
@@ -80,6 +102,36 @@ def show_home():
 
 def show_version_page():
     version_frame.tkraise()
+
+def show_nicknames_page():
+    render_nickname_list()
+    nickname_frame.tkraise()
+
+def select_nickname(name):
+    username_entry.delete(0, "end")
+    username_entry.insert(0, name)
+    show_home()
+
+def build_nickname_row(name):
+    row = ctk.CTkFrame(nickname_list_frame, fg_color="#1a1d1f", corner_radius=8, border_width=2, border_color="#1a1d1f")
+    color = ICON_COLORS[hash(name) % len(ICON_COLORS)]
+    ctk.CTkLabel(row, text=name[:1].upper(), width=22, height=22, corner_radius=11, fg_color=color, font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, padx=(8, 8), pady=6)
+    ctk.CTkLabel(row, text=name, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew")
+    row.grid_columnconfigure(1, weight=1, minsize=50)
+    for widget in row.winfo_children():
+        widget.bind("<Button-1>", lambda _e, n=name: select_nickname(n))
+    row.bind("<Button-1>", lambda _e, n=name: select_nickname(n))
+    return row
+
+def render_nickname_list():
+    for widget in nickname_list_frame.winfo_children():
+        widget.destroy()
+    nicknames = load_nicknames()
+    if not nicknames:
+        ctk.CTkLabel(nickname_list_frame, text="Пока нет сохранённых ников", text_color="#9a9a9a").pack(pady=20)
+        return
+    for name in nicknames:
+        build_nickname_row(name).pack(fill="x", pady=3)
 
 def set_active_type(version_type):
     global active_type, current_page
@@ -175,10 +227,18 @@ home_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
 home_frame.grid(row=0, column=0, sticky="nsew")
 version_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
 version_frame.grid(row=0, column=0, sticky="nsew")
+nickname_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
+nickname_frame.grid(row=0, column=0, sticky="nsew")
 
 ctk.CTkLabel(home_frame, text="Minecraft Launcher", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
-username_entry = ctk.CTkEntry(home_frame, placeholder_text="Никнейм")
-username_entry.pack(pady=(0, 10), padx=25, fill="x")
+
+nickname_row = ctk.CTkFrame(home_frame, fg_color="transparent")
+nickname_row.pack(pady=(0, 10), padx=25, fill="x")
+saved_nicknames = load_nicknames()
+username_entry = ctk.CTkEntry(nickname_row, placeholder_text="Никнейм")
+username_entry.pack(side="left", fill="x", expand=True)
+username_entry.insert(0, saved_nicknames[0] if saved_nicknames else "")
+ctk.CTkButton(nickname_row, text="☰", width=32, command=show_nicknames_page).pack(side="left", padx=(6, 0))
 
 version_button = ctk.CTkButton(
     home_frame, text="Версия: ...", anchor="w",
@@ -226,6 +286,17 @@ page_label = ctk.CTkLabel(pagination, text="", font=ctk.CTkFont(size=11))
 page_label.pack(side="left", expand=True)
 next_button = ctk.CTkButton(pagination, text="▶", width=30, height=24, command=next_page)
 next_button.pack(side="right")
+
+nickname_header = ctk.CTkFrame(nickname_frame, fg_color="transparent")
+nickname_header.pack(fill="x", padx=12, pady=(10, 6))
+ctk.CTkButton(
+    nickname_header, text="←", width=28, height=24, fg_color="transparent",
+    text_color="#c9c9c9", hover_color="#232628", command=show_home,
+).pack(side="left", padx=(0, 8))
+ctk.CTkLabel(nickname_header, text="Никнеймы", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+nickname_list_frame = ctk.CTkScrollableFrame(nickname_frame, fg_color="transparent")
+nickname_list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
 show_home()
 threading.Thread(target=load_versions, daemon=True).start()
 
