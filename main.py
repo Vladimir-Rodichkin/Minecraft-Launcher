@@ -1,8 +1,10 @@
 import json
 import os
 import subprocess
+import sys
 import threading
 from datetime import datetime
+from tkinter import filedialog
 
 import customtkinter as ctk
 import minecraft_launcher_lib as mll
@@ -11,7 +13,7 @@ MINECRAFT_DIR = os.path.join(os.environ["APPDATA"], ".simple_mc_launcher")
 CONFIG_PATH = os.path.join(MINECRAFT_DIR, "config.json")
 PAGE_SIZE = 3
 MAX_SAVED_NICKNAMES = 8
-
+DEFAULT_SETTINGS = {"java_path": "", "min_ram": "512", "max_ram": "2048", "jvm_args": ""}
 ACCENT = "#3b82f6"
 ACCENT_HOVER = "#2f6fd1"
 BADGE_BG = "#173350"
@@ -30,33 +32,47 @@ current_page = 0
 total_pages = 1
 selected_version = None
 version_rows = {}
+game_process = None
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data.setdefault("nicknames", [])
+    data.setdefault("settings", dict(DEFAULT_SETTINGS))
+    return data
+
+def write_config(data):
+    os.makedirs(MINECRAFT_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def load_nicknames():
-    try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f).get("nicknames", [])
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def write_nicknames(nicknames):
-    os.makedirs(MINECRAFT_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump({"nicknames": nicknames}, f, ensure_ascii=False, indent=2)
-    return nicknames
-
+    return load_config()["nicknames"]
 
 def save_nickname(name):
-    nicknames = [n for n in load_nicknames() if n != name]
+    config = load_config()
+    nicknames = [n for n in config["nicknames"] if n != name]
     nicknames.insert(0, name)
-    return write_nicknames(nicknames[:MAX_SAVED_NICKNAMES])
-
+    config["nicknames"] = nicknames[:MAX_SAVED_NICKNAMES]
+    write_config(config)
 
 def delete_nickname(name):
-    write_nicknames([n for n in load_nicknames() if n != name])
+    config = load_config()
+    config["nicknames"] = [n for n in config["nicknames"] if n != name]
+    write_config(config)
     render_nickname_list()
 
+def load_settings():
+    return load_config()["settings"]
+
+def save_settings(settings):
+    config = load_config()
+    config["settings"] = settings
+    write_config(config)
 
 def format_date(value):
     dt = value if isinstance(value, datetime) else datetime.fromisoformat(value)
@@ -74,9 +90,32 @@ def load_versions():
     latest_ids = mll.utils.get_latest_version()
     root.after(0, render_version_list)
 
+def clear_logs():
+    log_textbox.configure(state="normal")
+    log_textbox.delete("1.0", "end")
+    log_textbox.configure(state="disabled")
+
+def append_log(line):
+    log_textbox.configure(state="normal")
+    log_textbox.insert("end", line)
+    log_textbox.see("end")
+    log_textbox.configure(state="disabled")
+
+def show_logs_page():
+    logs_frame.tkraise()
+
+def stop_game():
+    if game_process and game_process.poll() is None:
+        game_process.terminate()
+        set_status("Останавливаем...")
+        stop_button.configure(state="disabled")
+
 def launch_game():
+    global game_process
+
     username = username_entry.get().strip() or "Player"
     version = selected_version
+    settings = load_settings()
 
     root.after(0, lambda: play_button.configure(state="disabled", text="Запуск..."))
     save_nickname(username)
@@ -91,17 +130,46 @@ def launch_game():
         options = mll.utils.generate_test_options()
         options["username"] = username
 
+        try:
+            min_ram = int(settings["min_ram"])
+        except ValueError:
+            min_ram = int(DEFAULT_SETTINGS["min_ram"])
+        try:
+            max_ram = int(settings["max_ram"])
+        except ValueError:
+            max_ram = int(DEFAULT_SETTINGS["max_ram"])
+
+        jvm_args = [f"-Xms{min_ram}M", f"-Xmx{max_ram}M"] + settings["jvm_args"].split()
+        options["jvmArguments"] = jvm_args
+        if settings["java_path"]:
+            options["executablePath"] = settings["java_path"]
+
         command = mll.command.get_minecraft_command(version, MINECRAFT_DIR, options)
-        subprocess.Popen(command, cwd=MINECRAFT_DIR)
-        set_status("Игра запущена")
+        game_process = subprocess.Popen(
+            command, cwd=MINECRAFT_DIR,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        root.after(0, clear_logs)
+        root.after(0, show_logs_page)
+        root.after(0, lambda: stop_button.configure(state="normal"))
+
+        for line in game_process.stdout:
+            root.after(0, lambda l=line: append_log(l))
+        game_process.wait()
+        set_status("Игра завершена")
     except Exception as exc:
         set_status(f"Ошибка: {exc}")
 
+    game_process = None
+    root.after(0, lambda: stop_button.configure(state="disabled"))
     root.after(0, lambda: play_button.configure(state="normal", text="Играть"))
 
 def on_play():
     if not selected_version:
         status_label.configure(text="Сначала выберите версию")
+        return
+    if game_process and game_process.poll() is None:
+        status_label.configure(text="Игра уже запущена")
         return
     threading.Thread(target=launch_game, daemon=True).start()
 
@@ -110,6 +178,33 @@ def show_home():
 
 def show_version_page():
     version_frame.tkraise()
+
+def show_settings_page():
+    settings = load_settings()
+    java_path_entry.delete(0, "end")
+    java_path_entry.insert(0, settings["java_path"])
+    min_ram_entry.delete(0, "end")
+    min_ram_entry.insert(0, settings["min_ram"])
+    max_ram_entry.delete(0, "end")
+    max_ram_entry.insert(0, settings["max_ram"])
+    jvm_args_entry.delete(0, "end")
+    jvm_args_entry.insert(0, settings["jvm_args"])
+    settings_frame.tkraise()
+
+def browse_java():
+    path = filedialog.askopenfilename(title="Выберите java.exe", filetypes=[("java.exe", "java.exe"), ("Все файлы", "*.*")])
+    if path:
+        java_path_entry.delete(0, "end")
+        java_path_entry.insert(0, path)
+
+def save_settings_and_back():
+    save_settings({
+        "java_path": java_path_entry.get().strip(),
+        "min_ram": min_ram_entry.get().strip() or DEFAULT_SETTINGS["min_ram"],
+        "max_ram": max_ram_entry.get().strip() or DEFAULT_SETTINGS["max_ram"],
+        "jvm_args": jvm_args_entry.get().strip(),
+    })
+    show_home()
 
 def show_nicknames_page():
     render_nickname_list()
@@ -233,10 +328,15 @@ def render_version_list():
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+BASE_DIR = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+ICON_PATH = os.path.join(BASE_DIR, "assets", "icon.ico")
+
 root = ctk.CTk()
 root.title("Minecraft Launcher")
 root.geometry("400x300")
 root.resizable(False, False)
+root.iconbitmap(ICON_PATH)
+root.after(250, lambda: root.iconbitmap(ICON_PATH))
 root.configure(fg_color="#0d0f10")
 root.grid_rowconfigure(0, weight=1)
 root.grid_columnconfigure(0, weight=1)
@@ -246,8 +346,16 @@ version_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
 version_frame.grid(row=0, column=0, sticky="nsew")
 nickname_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
 nickname_frame.grid(row=0, column=0, sticky="nsew")
+settings_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
+settings_frame.grid(row=0, column=0, sticky="nsew")
+logs_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
+logs_frame.grid(row=0, column=0, sticky="nsew")
 
 ctk.CTkLabel(home_frame, text="Minecraft Launcher", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+ctk.CTkButton(
+    home_frame, text="⚙", width=28, height=24, fg_color="transparent",
+    text_color="#c9c9c9", hover_color="#1a1d1f", command=show_settings_page,
+).place(relx=1.0, x=-14, y=14, anchor="ne")
 
 nickname_row = ctk.CTkFrame(home_frame, fg_color="transparent")
 nickname_row.pack(pady=(0, 10), padx=25, fill="x")
@@ -258,7 +366,7 @@ username_entry.insert(0, saved_nicknames[0] if saved_nicknames else "")
 ctk.CTkButton(nickname_row, text="☰", width=32, command=show_nicknames_page).pack(side="left", padx=(6, 0))
 
 version_button = ctk.CTkButton(
-    home_frame, text="Версия: ...", anchor="w",
+    home_frame, text="Выберите версию игры...", anchor="w",
     fg_color="#141617", hover_color="#1a1d1f", text_color="#e5e5e5",
     command=show_version_page,
 )
@@ -313,6 +421,52 @@ ctk.CTkButton(
 ctk.CTkLabel(nickname_header, text="Никнеймы", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
 nickname_list_frame = ctk.CTkScrollableFrame(nickname_frame, fg_color="transparent")
 nickname_list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+settings_header = ctk.CTkFrame(settings_frame, fg_color="transparent")
+settings_header.pack(fill="x", padx=12, pady=(10, 10))
+ctk.CTkButton(
+    settings_header, text="←", width=28, height=24, fg_color="transparent",
+    text_color="#c9c9c9", hover_color="#232628", command=show_home,
+).pack(side="left", padx=(0, 8))
+ctk.CTkLabel(settings_header, text="Настройки", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+
+ctk.CTkLabel(settings_frame, text="Путь к Java (пусто = по умолчанию)", font=ctk.CTkFont(size=11), text_color="#9a9a9a", anchor="w").pack(fill="x", padx=12)
+java_path_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
+java_path_row.pack(fill="x", padx=12, pady=(2, 8))
+java_path_entry = ctk.CTkEntry(java_path_row, height=26)
+java_path_entry.pack(side="left", fill="x", expand=True)
+ctk.CTkButton(java_path_row, text="...", width=30, height=26, command=browse_java).pack(side="left", padx=(6, 0))
+
+ctk.CTkLabel(settings_frame, text="Память, МБ (мин / макс)", font=ctk.CTkFont(size=11), text_color="#9a9a9a", anchor="w").pack(fill="x", padx=12)
+ram_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
+ram_row.pack(fill="x", padx=12, pady=(2, 8))
+min_ram_entry = ctk.CTkEntry(ram_row, height=26)
+min_ram_entry.pack(side="left", fill="x", expand=True)
+max_ram_entry = ctk.CTkEntry(ram_row, height=26)
+max_ram_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+ctk.CTkLabel(settings_frame, text="Аргументы JVM", font=ctk.CTkFont(size=11), text_color="#9a9a9a", anchor="w").pack(fill="x", padx=12)
+jvm_args_entry = ctk.CTkEntry(settings_frame, height=26, placeholder_text="-Dfoo=bar -Dbaz=qux")
+jvm_args_entry.pack(fill="x", padx=12, pady=(2, 10))
+
+ctk.CTkButton(settings_frame, text="Сохранить", command=save_settings_and_back).pack(padx=12, pady=(0, 12), fill="x")
+
+logs_header = ctk.CTkFrame(logs_frame, fg_color="transparent")
+logs_header.pack(fill="x", padx=12, pady=(10, 6))
+ctk.CTkButton(
+    logs_header, text="←", width=28, height=24, fg_color="transparent",
+    text_color="#c9c9c9", hover_color="#232628", command=show_home,
+).pack(side="left", padx=(0, 8))
+ctk.CTkLabel(logs_header, text="Логи запуска", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+
+log_textbox = ctk.CTkTextbox(logs_frame, state="disabled", font=ctk.CTkFont(size=10, family="Consolas"))
+log_textbox.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+
+stop_button = ctk.CTkButton(
+    logs_frame, text="Остановить", state="disabled",
+    fg_color="#b23b3b", hover_color="#8f2e2e", command=stop_game,
+)
+stop_button.pack(fill="x", padx=12, pady=(0, 12))
 
 show_home()
 threading.Thread(target=load_versions, daemon=True).start()
