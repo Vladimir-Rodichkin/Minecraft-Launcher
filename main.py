@@ -11,8 +11,9 @@ from tkinter import filedialog
 import customtkinter as ctk
 import minecraft_launcher_lib as mll
 
-MINECRAFT_DIR = os.path.join(os.environ["APPDATA"], ".simple_mc_launcher")
-CONFIG_PATH = os.path.join(MINECRAFT_DIR, "config.json")
+MINECRAFT_DIR = os.path.join(os.environ["APPDATA"], ".minecraft")
+APP_DATA_DIR = os.path.join(os.environ["APPDATA"], ".simple_mc_launcher")
+CONFIG_PATH = os.path.join(APP_DATA_DIR, "config.json")
 PAGE_SIZE = 3
 MAX_SAVED_NICKNAMES = 8
 DEFAULT_SETTINGS = {"java_path": "", "min_ram": "512", "max_ram": "2048", "jvm_args": ""}
@@ -31,7 +32,7 @@ BAR_MUTED = "#2a4a72"
 BAR_WIDTH = 24
 BAR_HEIGHT = 26
 
-LOADERS = [("vanilla", "Ванила"), ("fabric", "Fabric"), ("quilt", "Quilt"), ("forge", "Forge"), ("neoforge", "NeoForge")]
+LOADERS = [("vanilla", "Ванила"), ("fabric", "Fabric"), ("quilt", "Quilt"), ("forge", "Forge"), ("neoforge", "NeoForge"), ("custom", "Свои версии")]
 
 all_versions = []
 latest_ids = {}
@@ -57,9 +58,34 @@ def load_config():
     return data
 
 def write_config(data):
-    os.makedirs(MINECRAFT_DIR, exist_ok=True)
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+def ensure_launcher_profiles():
+    stub = {
+        "profiles": {},
+        "settings": {
+            "crashAssistance": True,
+            "enableAdvanced": False,
+            "enableAnalytics": True,
+            "enableHistorical": False,
+            "enableReleases": True,
+            "enableSnapshots": False,
+            "keepLauncherOpen": False,
+            "profileSorting": "ByLastPlayed",
+            "showGameLog": False,
+            "showMenu": False,
+            "soundOn": False,
+        },
+        "version": 3,
+    }
+    os.makedirs(MINECRAFT_DIR, exist_ok=True)
+    for filename in ("launcher_profiles.json", "launcher_profiles_microsoft_store.json"):
+        path = os.path.join(MINECRAFT_DIR, filename)
+        if not os.path.isfile(path):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(stub, f, indent=2)
 
 
 def load_nicknames():
@@ -427,7 +453,7 @@ def set_active_loader(loader_id):
             button.configure(fg_color=ACCENT, text_color="#0d0f10")
         else:
             button.configure(fg_color="transparent", text_color="#c9c9c9")
-    if loader_id != "vanilla" and loader_id not in loader_versions_cache:
+    if loader_id not in ("vanilla", "custom") and loader_id not in loader_versions_cache:
         install_progress_label.configure(text="Загрузка списка версий...")
         threading.Thread(target=load_loader_versions_thread, args=(loader_id,), daemon=True).start()
     else:
@@ -452,6 +478,12 @@ def on_search_changed(*_args):
     current_page = 0
     render_version_list()
 
+def first_page():
+    global current_page
+    if current_page > 0:
+        current_page = 0
+        render_version_list()
+
 def prev_page():
     global current_page
     if current_page > 0:
@@ -463,6 +495,12 @@ def next_page():
     global current_page
     if current_page < total_pages - 1:
         current_page += 1
+        render_version_list()
+
+def last_page():
+    global current_page
+    if current_page < total_pages - 1:
+        current_page = total_pages - 1
         render_version_list()
 
 def select_version(version_id):
@@ -489,8 +527,10 @@ def set_loader_page_locked(locked):
     for button in loader_tabs_buttons.values():
         button.configure(state=state)
     search_entry.configure(state=state)
+    first_button.configure(state="disabled" if locked else ("normal" if current_page > 0 else "disabled"))
     prev_button.configure(state="disabled" if locked else ("normal" if current_page > 0 else "disabled"))
     next_button.configure(state="disabled" if locked else ("normal" if current_page < total_pages - 1 else "disabled"))
+    last_button.configure(state="disabled" if locked else ("normal" if current_page < total_pages - 1 else "disabled"))
     cancel_loader_button.configure(state="normal" if locked else "disabled")
 
 def cancel_loader_install():
@@ -527,7 +567,7 @@ def install_and_select_thread(loader_id, vanilla_version):
     root.after(0, lambda: set_loader_page_locked(False))
 
 def on_version_row_click(vanilla_version):
-    if active_loader == "vanilla":
+    if active_loader in ("vanilla", "custom"):
         select_version(vanilla_version)
         return
     if loader_installing:
@@ -537,6 +577,19 @@ def on_version_row_click(vanilla_version):
         select_version(existing)
         return
     threading.Thread(target=install_and_select_thread, args=(active_loader, vanilla_version), daemon=True).start()
+
+LOADER_KEYWORDS = ("fabric", "quilt", "forge", "neoforge")
+
+def get_custom_installed_versions():
+    official_ids = {v["id"] for v in all_versions}
+    custom = []
+    for v in mll.utils.get_installed_versions(MINECRAFT_DIR):
+        if v["id"] in official_ids:
+            continue
+        if any(k in v["id"].lower() for k in LOADER_KEYWORDS):
+            continue
+        custom.append(v)
+    return custom
 
 def build_version_row(version_id, is_latest, release_time, is_installed_modded):
     row = ctk.CTkFrame(list_frame, fg_color="#1a1d1f", corner_radius=8, border_width=2, border_color="#1a1d1f")
@@ -578,6 +631,12 @@ def render_version_list():
     if active_loader == "vanilla":
         latest_for_type = latest_ids.get("release")
         filtered_ids = [v["id"] for v in all_versions if v["type"] == "release" and query in v["id"].lower()]
+    elif active_loader == "custom":
+        latest_for_type = None
+        custom_versions = get_custom_installed_versions()
+        for v in custom_versions:
+            versions_by_id[v["id"]] = v
+        filtered_ids = [v["id"] for v in custom_versions if query in v["id"].lower()]
     else:
         latest_for_type = None
         filtered_ids = [vid for vid in loader_versions_cache.get(active_loader, []) if query in vid.lower()]
@@ -587,20 +646,26 @@ def render_version_list():
     start = current_page * PAGE_SIZE
     page_items = filtered_ids[start:start + PAGE_SIZE]
 
+    is_direct_select = active_loader in ("vanilla", "custom")
     for version_id in page_items:
         meta = versions_by_id.get(version_id)
         release_time = meta["releaseTime"] if meta else None
-        installed_modded_id = find_installed_modded_id(active_loader, version_id) if active_loader != "vanilla" else None
-        row, check_label = build_version_row(version_id, version_id == latest_for_type, release_time, installed_modded_id is not None)
+        installed_modded_id = None if is_direct_select else find_installed_modded_id(active_loader, version_id)
+        row, check_label = build_version_row(
+            version_id, version_id == latest_for_type, release_time,
+            installed_modded_id is not None,
+        )
         row.pack(fill="x", pady=3)
         version_rows[version_id] = (row, check_label)
-        is_selected = version_id == selected_version if active_loader == "vanilla" else installed_modded_id == selected_version
+        is_selected = version_id == selected_version if is_direct_select else installed_modded_id == selected_version
         if is_selected:
             row.configure(border_color=ACCENT)
             check_label.configure(text="✓")
     page_label.configure(text=f"Стр. {current_page + 1} из {total_pages}")
+    first_button.configure(state="normal" if current_page > 0 else "disabled")
     prev_button.configure(state="normal" if current_page > 0 else "disabled")
     next_button.configure(state="normal" if current_page < total_pages - 1 else "disabled")
+    last_button.configure(state="normal" if current_page < total_pages - 1 else "disabled")
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -705,7 +770,7 @@ tabs.pack(fill="x", padx=12)
 loader_tabs_buttons = {}
 for i, (loader_id, loader_label) in enumerate(LOADERS):
     button = ctk.CTkButton(
-        tabs, text=loader_label, width=70, height=24, font=ctk.CTkFont(size=10),
+        tabs, text=loader_label, width=58, height=24, font=ctk.CTkFont(size=9),
         fg_color=ACCENT if loader_id == "vanilla" else "transparent",
         text_color="#0d0f10" if loader_id == "vanilla" else "#c9c9c9",
         hover_color="#232628", command=lambda l=loader_id: set_active_loader(l),
@@ -723,12 +788,16 @@ list_frame = ctk.CTkFrame(version_frame, fg_color="transparent")
 list_frame.pack(fill="both", expand=True, padx=12)
 pagination = ctk.CTkFrame(version_frame, fg_color="transparent")
 pagination.pack(fill="x", padx=12, pady=(4, 4))
-prev_button = ctk.CTkButton(pagination, text="◀", width=30, height=24, command=prev_page)
-prev_button.pack(side="left")
+first_button = ctk.CTkButton(pagination, text="|◀", width=26, height=24, font=ctk.CTkFont(size=11), command=first_page)
+first_button.pack(side="left")
+prev_button = ctk.CTkButton(pagination, text="◀", width=26, height=24, command=prev_page)
+prev_button.pack(side="left", padx=(2, 0))
 page_label = ctk.CTkLabel(pagination, text="", font=ctk.CTkFont(size=11))
 page_label.pack(side="left", expand=True)
-next_button = ctk.CTkButton(pagination, text="▶", width=30, height=24, command=next_page)
-next_button.pack(side="right")
+last_button = ctk.CTkButton(pagination, text="▶|", width=26, height=24, font=ctk.CTkFont(size=11), command=last_page)
+last_button.pack(side="right")
+next_button = ctk.CTkButton(pagination, text="▶", width=26, height=24, command=next_page)
+next_button.pack(side="right", padx=(0, 2))
 cancel_loader_button = ctk.CTkButton(
     version_frame, text="✕ Отменить установку", height=24, font=ctk.CTkFont(size=11), state="disabled",
     fg_color="#b23b3b", hover_color="#8f2e2e", command=cancel_loader_install,
@@ -803,6 +872,7 @@ ctk.CTkButton(mods_frame, text="+ Добавить .jar", height=28, command=add
 mods_list_frame = ctk.CTkScrollableFrame(mods_frame, fg_color="transparent")
 mods_list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
+ensure_launcher_profiles()
 render_activity_card()
 show_home()
 threading.Thread(target=load_versions, daemon=True).start()
