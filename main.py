@@ -89,6 +89,11 @@ def record_session(version, duration_seconds):
         versions_used.append(version)
     write_config(config)
 
+def save_last_version(version):
+    config = load_config()
+    config["last_version"] = version
+    write_config(config)
+
 def format_duration(seconds):
     total_minutes = int(seconds // 60)
     h, m = divmod(total_minutes, 60)
@@ -170,6 +175,7 @@ def launch_game():
             command, cwd=MINECRAFT_DIR,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
+        save_last_version(version)
         root.after(0, clear_logs)
         root.after(0, show_logs_page)
         root.after(0, lambda: stop_button.configure(state="normal"))
@@ -306,12 +312,12 @@ def set_active_type(version_type):
     global active_type, current_page
     active_type = version_type
     current_page = 0
-    if version_type == "release":
-        releases_tab.configure(fg_color=ACCENT, text_color="#0d0f10")
-        snapshots_tab.configure(fg_color="transparent", text_color="#c9c9c9")
-    else:
-        snapshots_tab.configure(fg_color=ACCENT, text_color="#0d0f10")
-        releases_tab.configure(fg_color="transparent", text_color="#c9c9c9")
+    tabs_by_type = {"release": releases_tab, "snapshot": snapshots_tab, "installed": installed_tab}
+    for t, button in tabs_by_type.items():
+        if t == version_type:
+            button.configure(fg_color=ACCENT, text_color="#0d0f10")
+        else:
+            button.configure(fg_color="transparent", text_color="#c9c9c9")
     render_version_list()
 
 def on_search_changed(*_args):
@@ -367,7 +373,11 @@ def render_version_list():
     version_rows.clear()
     query = search_var.get().strip().lower()
     latest_for_type = latest_ids.get(active_type)
-    filtered = [v for v in all_versions if v["type"] == active_type and query in v["id"].lower()]
+    if active_type == "installed":
+        source = mll.utils.get_installed_versions(MINECRAFT_DIR)
+    else:
+        source = [v for v in all_versions if v["type"] == active_type]
+    filtered = [v for v in source if query in v["id"].lower()]
     total_pages = max(1, -(-len(filtered) // PAGE_SIZE))
     current_page = min(current_page, total_pages - 1)
     start = current_page * PAGE_SIZE
@@ -429,6 +439,11 @@ version_button = ctk.CTkButton(
 )
 version_button.pack(pady=(0, 4), padx=20, fill="x")
 
+last_version = load_config().get("last_version")
+if last_version:
+    selected_version = last_version
+    version_button.configure(text=f"Версия: {last_version}")
+
 activity_card = ctk.CTkFrame(home_frame, fg_color="#141617", corner_radius=10)
 activity_card.pack(pady=(0, 4), padx=20, fill="x")
 
@@ -471,15 +486,20 @@ ctk.CTkLabel(header, text="Версия Minecraft", font=ctk.CTkFont(size=14, we
 tabs = ctk.CTkFrame(version_frame, fg_color="transparent")
 tabs.pack(fill="x", padx=12)
 releases_tab = ctk.CTkButton(
-    tabs, text="Релизы", width=80, height=26, fg_color=ACCENT, text_color="#0d0f10",
+    tabs, text="Релизы", width=72, height=26, font=ctk.CTkFont(size=12), fg_color=ACCENT, text_color="#0d0f10",
     hover_color=ACCENT_HOVER, command=lambda: set_active_type("release"),
 )
 releases_tab.pack(side="left")
 snapshots_tab = ctk.CTkButton(
-    tabs, text="Снапшоты", width=80, height=26, fg_color="transparent", text_color="#c9c9c9",
+    tabs, text="Снапшоты", width=72, height=26, font=ctk.CTkFont(size=12), fg_color="transparent", text_color="#c9c9c9",
     hover_color="#232628", command=lambda: set_active_type("snapshot"),
 )
-snapshots_tab.pack(side="left", padx=(6, 0))
+snapshots_tab.pack(side="left", padx=(4, 0))
+installed_tab = ctk.CTkButton(
+    tabs, text="Загружено", width=72, height=26, font=ctk.CTkFont(size=12), fg_color="transparent", text_color="#c9c9c9",
+    hover_color="#232628", command=lambda: set_active_type("installed"),
+)
+installed_tab.pack(side="left", padx=(4, 0))
 
 search_var = ctk.StringVar()
 search_var.trace_add("write", on_search_changed)
