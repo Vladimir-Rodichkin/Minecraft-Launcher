@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -30,14 +31,20 @@ BAR_MUTED = "#2a4a72"
 BAR_WIDTH = 24
 BAR_HEIGHT = 26
 
+LOADERS = [("vanilla", "Ванила"), ("fabric", "Fabric"), ("quilt", "Quilt"), ("forge", "Forge"), ("neoforge", "NeoForge")]
+
 all_versions = []
 latest_ids = {}
-active_type = "release"
+active_loader = "vanilla"
 current_page = 0
 total_pages = 1
 selected_version = None
 version_rows = {}
 game_process = None
+loader_versions_cache = {}
+loader_installing = False
+installing_game = False
+cancel_requested = False
 
 def load_config():
     try:
@@ -106,6 +113,35 @@ def format_date(value):
 def is_installed(version):
     return any(v["id"] == version for v in mll.utils.get_installed_versions(MINECRAFT_DIR))
 
+class InstallCancelled(Exception):
+    pass
+
+def cancellable(fn):
+    def wrapper(text):
+        if cancel_requested:
+            raise InstallCancelled()
+        fn(text)
+    return wrapper
+
+def ensure_java_runtime(version, on_progress=None):
+    try:
+        info = mll.runtime.get_version_runtime_information(version, MINECRAFT_DIR)
+    except Exception:
+        return None
+    if not info:
+        return None
+    component = info["name"]
+    path = mll.runtime.get_executable_path(component, MINECRAFT_DIR)
+    if path:
+        return path
+    try:
+        mll.runtime.install_jvm_runtime(component, MINECRAFT_DIR, callback={"setStatus": on_progress} if on_progress else None)
+    except InstallCancelled:
+        raise
+    except Exception:
+        return None
+    return mll.runtime.get_executable_path(component, MINECRAFT_DIR)
+
 def set_status(text):
     root.after(0, lambda: status_label.configure(text=text))
 
@@ -135,21 +171,36 @@ def stop_game():
         set_status("Останавливаем...")
         stop_button.configure(state="disabled")
 
+def set_home_locked(locked):
+    state = "disabled" if locked else "normal"
+    username_entry.configure(state=state)
+    nicknames_button.configure(state=state)
+    version_button.configure(state=state)
+    settings_button.configure(state=state)
+
+def cancel_launch():
+    global cancel_requested
+    cancel_requested = True
+    status_label.configure(text="Отмена...")
+
 def launch_game():
-    global game_process
+    global game_process, installing_game, cancel_requested
 
     username = username_entry.get().strip() or "Player"
     version = selected_version
     settings = load_settings()
 
-    root.after(0, lambda: play_button.configure(state="disabled", text="Запуск..."))
+    installing_game = True
+    cancel_requested = False
+    root.after(0, lambda: play_button.configure(state="normal", text="Отменить", command=cancel_launch))
+    root.after(0, lambda: set_home_locked(True))
     save_nickname(username)
 
     try:
         if not is_installed(version):
             mll.install.install_minecraft_version(
                 version, MINECRAFT_DIR,
-                callback={"setStatus": set_status},
+                callback={"setStatus": cancellable(set_status)},
             )
 
         options = mll.utils.generate_test_options()
@@ -168,8 +219,14 @@ def launch_game():
         options["jvmArguments"] = jvm_args
         if settings["java_path"]:
             options["executablePath"] = settings["java_path"]
+        else:
+            runtime_java = ensure_java_runtime(version, on_progress=cancellable(set_status))
+            if runtime_java:
+                options["executablePath"] = runtime_java
 
         command = mll.command.get_minecraft_command(version, MINECRAFT_DIR, options)
+        installing_game = False
+        root.after(0, lambda: set_home_locked(False))
         start_ts = time.time()
         game_process = subprocess.Popen(
             command, cwd=MINECRAFT_DIR,
@@ -187,14 +244,22 @@ def launch_game():
         record_session(version, time.time() - start_ts)
         root.after(0, render_activity_card)
         set_status("Игра завершена")
+    except InstallCancelled:
+        set_status("Установка отменена")
     except Exception as exc:
-        set_status(f"Ошибка: {exc}")
+        message = f"Ошибка: {exc}"
+        set_status(message)
 
+    installing_game = False
+    cancel_requested = False
     game_process = None
+    root.after(0, lambda: set_home_locked(False))
     root.after(0, lambda: stop_button.configure(state="disabled"))
     root.after(0, lambda: play_button.configure(state="normal", text="Играть", command=on_play))
 
 def on_play():
+    if installing_game:
+        return
     if not selected_version:
         status_label.configure(text="Сначала выберите версию")
         return
@@ -241,6 +306,49 @@ def show_home():
 
 def show_version_page():
     version_frame.tkraise()
+
+def mods_dir():
+    return os.path.join(MINECRAFT_DIR, "mods")
+
+def build_mod_row(name):
+    row = ctk.CTkFrame(mods_list_frame, fg_color="#1a1d1f", corner_radius=8)
+    ctk.CTkLabel(row, text=name, font=ctk.CTkFont(size=12), anchor="w").pack(side="left", fill="x", expand=True, padx=(10, 4), pady=6)
+    ctk.CTkButton(
+        row, text="✕", width=24, height=24, fg_color="transparent",
+        text_color="#9a9a9a", hover_color="#3a1f1f", command=lambda n=name: delete_mod(n),
+    ).pack(side="right", padx=(0, 8))
+    return row
+
+def render_mods_list():
+    for widget in mods_list_frame.winfo_children():
+        widget.destroy()
+    os.makedirs(mods_dir(), exist_ok=True)
+    files = sorted(f for f in os.listdir(mods_dir()) if f.lower().endswith(".jar"))
+    if not files:
+        ctk.CTkLabel(mods_list_frame, text="Модов пока нет", text_color="#9a9a9a").pack(pady=20)
+        return
+    for name in files:
+        build_mod_row(name).pack(fill="x", pady=3)
+
+def add_mods():
+    paths = filedialog.askopenfilenames(title="Выберите .jar файлы модов", filetypes=[("Jar files", "*.jar")])
+    if not paths:
+        return
+    os.makedirs(mods_dir(), exist_ok=True)
+    for path in paths:
+        shutil.copy(path, os.path.join(mods_dir(), os.path.basename(path)))
+    render_mods_list()
+
+def delete_mod(name):
+    try:
+        os.remove(os.path.join(mods_dir(), name))
+    except OSError:
+        pass
+    render_mods_list()
+
+def show_mods_page():
+    render_mods_list()
+    mods_frame.tkraise()
 
 def show_settings_page():
     settings = load_settings()
@@ -308,17 +416,36 @@ def render_nickname_list():
     for name in nicknames:
         build_nickname_row(name).pack(fill="x", pady=3)
 
-def set_active_type(version_type):
-    global active_type, current_page
-    active_type = version_type
+def set_active_loader(loader_id):
+    global active_loader, current_page
+    if loader_installing:
+        return
+    active_loader = loader_id
     current_page = 0
-    tabs_by_type = {"release": releases_tab, "snapshot": snapshots_tab, "installed": installed_tab}
-    for t, button in tabs_by_type.items():
-        if t == version_type:
+    for lid, button in loader_tabs_buttons.items():
+        if lid == loader_id:
             button.configure(fg_color=ACCENT, text_color="#0d0f10")
         else:
             button.configure(fg_color="transparent", text_color="#c9c9c9")
+    if loader_id != "vanilla" and loader_id not in loader_versions_cache:
+        install_progress_label.configure(text="Загрузка списка версий...")
+        threading.Thread(target=load_loader_versions_thread, args=(loader_id,), daemon=True).start()
+    else:
+        install_progress_label.configure(text="")
     render_version_list()
+
+def load_loader_versions_thread(loader_id):
+    try:
+        loader = mll.mod_loader.get_mod_loader(loader_id)
+        versions = loader.get_minecraft_versions(True)
+    except Exception:
+        versions = []
+    loader_versions_cache[loader_id] = versions
+    def apply():
+        if loader_id == active_loader:
+            install_progress_label.configure(text="")
+            render_version_list()
+    root.after(0, apply)
 
 def on_search_changed(*_args):
     global current_page
@@ -344,11 +471,78 @@ def select_version(version_id):
     version_button.configure(text=f"Версия: {version_id}")
     show_home()
 
-def build_version_row(version, is_latest):
+def find_installed_modded_id(loader_id, vanilla_version):
+    for v in mll.utils.get_installed_versions(MINECRAFT_DIR):
+        vid = v["id"].lower()
+        if vanilla_version not in v["id"]:
+            continue
+        if loader_id == "forge" and "forge" in vid and "neoforge" not in vid:
+            return v["id"]
+        if loader_id == "neoforge" and "neoforge" in vid:
+            return v["id"]
+        if loader_id in ("fabric", "quilt") and loader_id in vid:
+            return v["id"]
+    return None
+
+def set_loader_page_locked(locked):
+    state = "disabled" if locked else "normal"
+    for button in loader_tabs_buttons.values():
+        button.configure(state=state)
+    search_entry.configure(state=state)
+    prev_button.configure(state="disabled" if locked else ("normal" if current_page > 0 else "disabled"))
+    next_button.configure(state="disabled" if locked else ("normal" if current_page < total_pages - 1 else "disabled"))
+    cancel_loader_button.configure(state="normal" if locked else "disabled")
+
+def cancel_loader_install():
+    global cancel_requested
+    cancel_requested = True
+    install_progress_label.configure(text="Отмена...")
+
+def install_and_select_thread(loader_id, vanilla_version):
+    global loader_installing, cancel_requested
+    loader_installing = True
+    cancel_requested = False
+    root.after(0, lambda: set_loader_page_locked(True))
+    root.after(0, lambda: install_progress_label.configure(text=f"Установка {loader_id} для {vanilla_version}..."))
+    try:
+        settings = load_settings()
+        status_callback = cancellable(lambda text: root.after(0, lambda: install_progress_label.configure(text=text)))
+        if not is_installed(vanilla_version):
+            mll.install.install_minecraft_version(vanilla_version, MINECRAFT_DIR, callback={"setStatus": status_callback})
+        java = settings["java_path"] or ensure_java_runtime(vanilla_version, on_progress=status_callback)
+        loader = mll.mod_loader.get_mod_loader(loader_id)
+        installed_id = loader.install(
+            vanilla_version, MINECRAFT_DIR, java=java,
+            callback={"setStatus": status_callback},
+        )
+        root.after(0, lambda: install_progress_label.configure(text=""))
+        root.after(0, lambda: select_version(installed_id))
+    except InstallCancelled:
+        root.after(0, lambda: install_progress_label.configure(text="Установка отменена"))
+    except Exception as exc:
+        message = f"Ошибка: {exc}"
+        root.after(0, lambda: install_progress_label.configure(text=message))
+    loader_installing = False
+    cancel_requested = False
+    root.after(0, lambda: set_loader_page_locked(False))
+
+def on_version_row_click(vanilla_version):
+    if active_loader == "vanilla":
+        select_version(vanilla_version)
+        return
+    if loader_installing:
+        return
+    existing = find_installed_modded_id(active_loader, vanilla_version)
+    if existing:
+        select_version(existing)
+        return
+    threading.Thread(target=install_and_select_thread, args=(active_loader, vanilla_version), daemon=True).start()
+
+def build_version_row(version_id, is_latest, release_time, is_installed_modded):
     row = ctk.CTkFrame(list_frame, fg_color="#1a1d1f", corner_radius=8, border_width=2, border_color="#1a1d1f")
-    color = ICON_COLORS[hash(version["id"]) % len(ICON_COLORS)]
+    color = ICON_COLORS[hash(version_id) % len(ICON_COLORS)]
     ctk.CTkLabel(row, text="", width=22, height=22, corner_radius=5, fg_color=color).grid(row=0, column=0, padx=(8, 8), pady=6)
-    ctk.CTkLabel(row, text=version["id"], font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew")
+    ctk.CTkLabel(row, text=version_id, font=ctk.CTkFont(size=13, weight="bold"), anchor="w").grid(row=0, column=1, sticky="ew")
     col = 2
     if is_latest:
         ctk.CTkLabel(
@@ -356,14 +550,21 @@ def build_version_row(version, is_latest):
             fg_color=BADGE_BG, text_color=BADGE_TEXT, corner_radius=5,
         ).grid(row=0, column=col, padx=(6, 0))
         col += 1
-    ctk.CTkLabel(row, text=format_date(version["releaseTime"]), text_color="#9a9a9a", font=ctk.CTkFont(size=11)).grid(row=0, column=col, padx=(6, 6))
+    if is_installed_modded:
+        ctk.CTkLabel(
+            row, text="установлено", font=ctk.CTkFont(size=10),
+            fg_color="#173a2b", text_color="#4caf6d", corner_radius=5,
+        ).grid(row=0, column=col, padx=(6, 0))
+        col += 1
+    if release_time:
+        ctk.CTkLabel(row, text=format_date(release_time), text_color="#9a9a9a", font=ctk.CTkFont(size=11)).grid(row=0, column=col, padx=(6, 6))
     col += 1
     check_label = ctk.CTkLabel(row, text="", width=14, text_color=ACCENT, font=ctk.CTkFont(size=13, weight="bold"))
     check_label.grid(row=0, column=col, padx=(0, 8))
     row.grid_columnconfigure(1, weight=1, minsize=50)
     for widget in row.winfo_children():
-        widget.bind("<Button-1>", lambda _e, vid=version["id"]: select_version(vid))
-    row.bind("<Button-1>", lambda _e, vid=version["id"]: select_version(vid))
+        widget.bind("<Button-1>", lambda _e, vid=version_id: on_version_row_click(vid))
+    row.bind("<Button-1>", lambda _e, vid=version_id: on_version_row_click(vid))
     return row, check_label
 
 def render_version_list():
@@ -372,21 +573,29 @@ def render_version_list():
         widget.destroy()
     version_rows.clear()
     query = search_var.get().strip().lower()
-    latest_for_type = latest_ids.get(active_type)
-    if active_type == "installed":
-        source = mll.utils.get_installed_versions(MINECRAFT_DIR)
+    versions_by_id = {v["id"]: v for v in all_versions}
+
+    if active_loader == "vanilla":
+        latest_for_type = latest_ids.get("release")
+        filtered_ids = [v["id"] for v in all_versions if v["type"] == "release" and query in v["id"].lower()]
     else:
-        source = [v for v in all_versions if v["type"] == active_type]
-    filtered = [v for v in source if query in v["id"].lower()]
-    total_pages = max(1, -(-len(filtered) // PAGE_SIZE))
+        latest_for_type = None
+        filtered_ids = [vid for vid in loader_versions_cache.get(active_loader, []) if query in vid.lower()]
+
+    total_pages = max(1, -(-len(filtered_ids) // PAGE_SIZE))
     current_page = min(current_page, total_pages - 1)
     start = current_page * PAGE_SIZE
-    page_items = filtered[start:start + PAGE_SIZE]
-    for version in page_items:
-        row, check_label = build_version_row(version, version["id"] == latest_for_type)
+    page_items = filtered_ids[start:start + PAGE_SIZE]
+
+    for version_id in page_items:
+        meta = versions_by_id.get(version_id)
+        release_time = meta["releaseTime"] if meta else None
+        installed_modded_id = find_installed_modded_id(active_loader, version_id) if active_loader != "vanilla" else None
+        row, check_label = build_version_row(version_id, version_id == latest_for_type, release_time, installed_modded_id is not None)
         row.pack(fill="x", pady=3)
-        version_rows[version["id"]] = (row, check_label)
-        if version["id"] == selected_version:
+        version_rows[version_id] = (row, check_label)
+        is_selected = version_id == selected_version if active_loader == "vanilla" else installed_modded_id == selected_version
+        if is_selected:
             row.configure(border_color=ACCENT)
             check_label.configure(text="✓")
     page_label.configure(text=f"Стр. {current_page + 1} из {total_pages}")
@@ -417,12 +626,15 @@ settings_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
 settings_frame.grid(row=0, column=0, sticky="nsew")
 logs_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
 logs_frame.grid(row=0, column=0, sticky="nsew")
+mods_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
+mods_frame.grid(row=0, column=0, sticky="nsew")
 
 ctk.CTkLabel(home_frame, text="Minecraft Launcher", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(8, 4))
-ctk.CTkButton(
+settings_button = ctk.CTkButton(
     home_frame, text="⚙", width=24, height=20, fg_color="transparent",
     text_color="#c9c9c9", hover_color="#1a1d1f", command=show_settings_page,
-).place(relx=1.0, x=-10, y=8, anchor="ne")
+)
+settings_button.place(relx=1.0, x=-10, y=8, anchor="ne")
 
 nickname_row = ctk.CTkFrame(home_frame, fg_color="transparent")
 nickname_row.pack(pady=(0, 4), padx=20, fill="x")
@@ -430,7 +642,8 @@ saved_nicknames = load_nicknames()
 username_entry = ctk.CTkEntry(nickname_row, placeholder_text="Никнейм", height=24)
 username_entry.pack(side="left", fill="x", expand=True)
 username_entry.insert(0, saved_nicknames[0] if saved_nicknames else "")
-ctk.CTkButton(nickname_row, text="☰", width=28, height=24, command=show_nicknames_page).pack(side="left", padx=(6, 0))
+nicknames_button = ctk.CTkButton(nickname_row, text="☰", width=28, height=24, command=show_nicknames_page)
+nicknames_button.pack(side="left", padx=(6, 0))
 
 version_button = ctk.CTkButton(
     home_frame, text="Выберите версию игры...", anchor="w", height=24,
@@ -476,45 +689,51 @@ play_button = ctk.CTkButton(home_frame, text="Играть", height=28, command=
 play_button.pack(pady=(0, 8), padx=20, fill="x")
 
 header = ctk.CTkFrame(version_frame, fg_color="transparent")
-header.pack(fill="x", padx=12, pady=(10, 6))
+header.pack(fill="x", padx=12, pady=(8, 4))
 ctk.CTkButton(
     header, text="←", width=28, height=24, fg_color="transparent",
     text_color="#c9c9c9", hover_color="#232628", command=show_home,
 ).pack(side="left", padx=(0, 8))
 ctk.CTkLabel(header, text="Версия Minecraft", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+ctk.CTkButton(
+    header, text="🧩 Моды", width=70, height=24, font=ctk.CTkFont(size=11), fg_color="transparent",
+    text_color="#c9c9c9", hover_color="#232628", command=show_mods_page,
+).pack(side="right")
 
 tabs = ctk.CTkFrame(version_frame, fg_color="transparent")
 tabs.pack(fill="x", padx=12)
-releases_tab = ctk.CTkButton(
-    tabs, text="Релизы", width=72, height=26, font=ctk.CTkFont(size=12), fg_color=ACCENT, text_color="#0d0f10",
-    hover_color=ACCENT_HOVER, command=lambda: set_active_type("release"),
-)
-releases_tab.pack(side="left")
-snapshots_tab = ctk.CTkButton(
-    tabs, text="Снапшоты", width=72, height=26, font=ctk.CTkFont(size=12), fg_color="transparent", text_color="#c9c9c9",
-    hover_color="#232628", command=lambda: set_active_type("snapshot"),
-)
-snapshots_tab.pack(side="left", padx=(4, 0))
-installed_tab = ctk.CTkButton(
-    tabs, text="Загружено", width=72, height=26, font=ctk.CTkFont(size=12), fg_color="transparent", text_color="#c9c9c9",
-    hover_color="#232628", command=lambda: set_active_type("installed"),
-)
-installed_tab.pack(side="left", padx=(4, 0))
+loader_tabs_buttons = {}
+for i, (loader_id, loader_label) in enumerate(LOADERS):
+    button = ctk.CTkButton(
+        tabs, text=loader_label, width=70, height=24, font=ctk.CTkFont(size=10),
+        fg_color=ACCENT if loader_id == "vanilla" else "transparent",
+        text_color="#0d0f10" if loader_id == "vanilla" else "#c9c9c9",
+        hover_color="#232628", command=lambda l=loader_id: set_active_loader(l),
+    )
+    button.pack(side="left", padx=(0 if i == 0 else 2, 0))
+    loader_tabs_buttons[loader_id] = button
 
 search_var = ctk.StringVar()
 search_var.trace_add("write", on_search_changed)
-search_entry = ctk.CTkEntry(version_frame, height=26, placeholder_text="🔍  Поиск версии...", textvariable=search_var)
-search_entry.pack(fill="x", padx=12, pady=6)
+search_entry = ctk.CTkEntry(version_frame, height=24, placeholder_text="🔍  Поиск версии...", textvariable=search_var)
+search_entry.pack(fill="x", padx=12, pady=4)
+install_progress_label = ctk.CTkLabel(version_frame, text="", font=ctk.CTkFont(size=10), text_color="#9a9a9a", anchor="w", height=16)
+install_progress_label.pack(fill="x", padx=12)
 list_frame = ctk.CTkFrame(version_frame, fg_color="transparent")
 list_frame.pack(fill="both", expand=True, padx=12)
 pagination = ctk.CTkFrame(version_frame, fg_color="transparent")
-pagination.pack(fill="x", padx=12, pady=(4, 10))
+pagination.pack(fill="x", padx=12, pady=(4, 4))
 prev_button = ctk.CTkButton(pagination, text="◀", width=30, height=24, command=prev_page)
 prev_button.pack(side="left")
 page_label = ctk.CTkLabel(pagination, text="", font=ctk.CTkFont(size=11))
 page_label.pack(side="left", expand=True)
 next_button = ctk.CTkButton(pagination, text="▶", width=30, height=24, command=next_page)
 next_button.pack(side="right")
+cancel_loader_button = ctk.CTkButton(
+    version_frame, text="✕ Отменить установку", height=24, font=ctk.CTkFont(size=11), state="disabled",
+    fg_color="#b23b3b", hover_color="#8f2e2e", command=cancel_loader_install,
+)
+cancel_loader_button.pack(fill="x", padx=12, pady=(0, 8))
 
 nickname_header = ctk.CTkFrame(nickname_frame, fg_color="transparent")
 nickname_header.pack(fill="x", padx=12, pady=(10, 6))
@@ -571,6 +790,18 @@ stop_button = ctk.CTkButton(
     fg_color="#b23b3b", hover_color="#8f2e2e", command=stop_game,
 )
 stop_button.pack(fill="x", padx=12, pady=(0, 12))
+
+mods_header = ctk.CTkFrame(mods_frame, fg_color="transparent")
+mods_header.pack(fill="x", padx=12, pady=(10, 6))
+ctk.CTkButton(
+    mods_header, text="←", width=28, height=24, fg_color="transparent",
+    text_color="#c9c9c9", hover_color="#232628", command=show_version_page,
+).pack(side="left", padx=(0, 8))
+ctk.CTkLabel(mods_header, text="Моды", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+
+ctk.CTkButton(mods_frame, text="+ Добавить .jar", height=28, command=add_mods).pack(fill="x", padx=12, pady=(0, 8))
+mods_list_frame = ctk.CTkScrollableFrame(mods_frame, fg_color="transparent")
+mods_list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
 render_activity_card()
 show_home()
