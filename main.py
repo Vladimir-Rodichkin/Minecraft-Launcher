@@ -5,6 +5,7 @@ import sys
 import threading
 from datetime import datetime
 from tkinter import filedialog
+from turtle import width
 
 import customtkinter as ctk
 import minecraft_launcher_lib as mll
@@ -152,6 +153,7 @@ def launch_game():
         root.after(0, clear_logs)
         root.after(0, show_logs_page)
         root.after(0, lambda: stop_button.configure(state="normal"))
+        root.after(0, lambda: play_button.configure(state="normal", text="Показать логи", command=show_logs_page))
 
         for line in game_process.stdout:
             root.after(0, lambda l=line: append_log(l))
@@ -162,14 +164,14 @@ def launch_game():
 
     game_process = None
     root.after(0, lambda: stop_button.configure(state="disabled"))
-    root.after(0, lambda: play_button.configure(state="normal", text="Играть"))
+    root.after(0, lambda: play_button.configure(state="normal", text="Играть", command=on_play))
 
 def on_play():
     if not selected_version:
         status_label.configure(text="Сначала выберите версию")
         return
     if game_process and game_process.poll() is None:
-        status_label.configure(text="Игра уже запущена")
+        show_logs_page()
         return
     threading.Thread(target=launch_game, daemon=True).start()
 
@@ -374,7 +376,7 @@ version_button.pack(pady=(0, 10), padx=25, fill="x")
 status_label = ctk.CTkLabel(home_frame, text="", font=ctk.CTkFont(size=11))
 status_label.pack(pady=(0, 20))
 play_button = ctk.CTkButton(home_frame, text="Играть", command=on_play)
-play_button.pack(pady=(0, 20), padx=25, fill="x")
+play_button.pack(pady=(50, 40), padx=25, fill="x")
 
 header = ctk.CTkFrame(version_frame, fg_color="transparent")
 header.pack(fill="x", padx=12, pady=(10, 6))
