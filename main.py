@@ -3,9 +3,9 @@ import os
 import subprocess
 import sys
 import threading
-from datetime import datetime
+import time
+from datetime import date, datetime, timedelta
 from tkinter import filedialog
-from turtle import width
 
 import customtkinter as ctk
 import minecraft_launcher_lib as mll
@@ -24,7 +24,11 @@ RU_MONTHS = {
     1: "янв.", 2: "февр.", 3: "мар.", 4: "апр.", 5: "мая", 6: "июн.",
     7: "июл.", 8: "авг.", 9: "сент.", 10: "окт.", 11: "нояб.", 12: "дек.",
 }
+WEEKDAY_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 ICON_COLORS = ["#e05fa0", "#4caf6d", "#8a6fe0", "#3b82f6", "#e0a75f", "#5fc7e0"]
+BAR_MUTED = "#2a4a72"
+BAR_WIDTH = 24
+BAR_HEIGHT = 26
 
 all_versions = []
 latest_ids = {}
@@ -74,6 +78,21 @@ def save_settings(settings):
     config = load_config()
     config["settings"] = settings
     write_config(config)
+
+def record_session(version, duration_seconds):
+    config = load_config()
+    activity = config.setdefault("activity", {})
+    today = date.today().isoformat()
+    activity[today] = activity.get(today, 0) + duration_seconds
+    versions_used = config.setdefault("versions_used", [])
+    if version not in versions_used:
+        versions_used.append(version)
+    write_config(config)
+
+def format_duration(seconds):
+    total_minutes = int(seconds // 60)
+    h, m = divmod(total_minutes, 60)
+    return f"{h}ч {m}м" if h else f"{m}м"
 
 def format_date(value):
     dt = value if isinstance(value, datetime) else datetime.fromisoformat(value)
@@ -146,6 +165,7 @@ def launch_game():
             options["executablePath"] = settings["java_path"]
 
         command = mll.command.get_minecraft_command(version, MINECRAFT_DIR, options)
+        start_ts = time.time()
         game_process = subprocess.Popen(
             command, cwd=MINECRAFT_DIR,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -158,6 +178,8 @@ def launch_game():
         for line in game_process.stdout:
             root.after(0, lambda l=line: append_log(l))
         game_process.wait()
+        record_session(version, time.time() - start_ts)
+        root.after(0, render_activity_card)
         set_status("Игра завершена")
     except Exception as exc:
         set_status(f"Ошибка: {exc}")
@@ -174,6 +196,39 @@ def on_play():
         show_logs_page()
         return
     threading.Thread(target=launch_game, daemon=True).start()
+
+def render_activity_card():
+    config = load_config()
+    activity = config.get("activity", {})
+    today = date.today()
+    days = [today - timedelta(days=i) for i in range(6, -1, -1)]
+    values = [activity.get(d.isoformat(), 0) for d in days]
+    max_value = max(values) or 1
+
+    activity_total_label.configure(text=format_duration(sum(values)))
+
+    for widget in bars_row.winfo_children():
+        widget.destroy()
+    for widget in day_labels_row.winfo_children():
+        widget.destroy()
+
+    n = len(days)
+    for i, (d, value) in enumerate(zip(days, values)):
+        is_today = d == today
+        bar_h = max(3, int(BAR_HEIGHT * value / max_value)) if value else 3
+        bar = ctk.CTkFrame(bars_row, fg_color=ACCENT if is_today else BAR_MUTED, corner_radius=4, width=BAR_WIDTH, height=bar_h)
+        bar.place(relx=(i + 0.5) / n, rely=1.0, anchor="s")
+        bar.bind("<Enter>", lambda _e, dd=d, vv=value: status_label.configure(text=f"{WEEKDAY_RU[dd.weekday()]}: {format_duration(vv)}"))
+
+        label = ctk.CTkLabel(
+            day_labels_row, text=WEEKDAY_RU[d.weekday()], font=ctk.CTkFont(size=9, weight="bold" if is_today else "normal"),
+            text_color=ACCENT if is_today else "#9a9a9a",
+        )
+        label.place(relx=(i + 0.5) / n, rely=0.5, anchor="c")
+
+    stat_versions_label.configure(text=f"🧩 {len(config.get('versions_used', []))}")
+    stat_time_label.configure(text=f"⏱ {format_duration(sum(activity.values()))}")
+    stat_accounts_label.configure(text=f"👤 {len(config.get('nicknames', []))}")
 
 def show_home():
     home_frame.tkraise()
@@ -353,30 +408,57 @@ settings_frame.grid(row=0, column=0, sticky="nsew")
 logs_frame = ctk.CTkFrame(root, fg_color="#0d0f10", corner_radius=0)
 logs_frame.grid(row=0, column=0, sticky="nsew")
 
-ctk.CTkLabel(home_frame, text="Minecraft Launcher", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(20, 10))
+ctk.CTkLabel(home_frame, text="Minecraft Launcher", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(8, 4))
 ctk.CTkButton(
-    home_frame, text="⚙", width=28, height=24, fg_color="transparent",
+    home_frame, text="⚙", width=24, height=20, fg_color="transparent",
     text_color="#c9c9c9", hover_color="#1a1d1f", command=show_settings_page,
-).place(relx=1.0, x=-14, y=14, anchor="ne")
+).place(relx=1.0, x=-10, y=8, anchor="ne")
 
 nickname_row = ctk.CTkFrame(home_frame, fg_color="transparent")
-nickname_row.pack(pady=(0, 10), padx=25, fill="x")
+nickname_row.pack(pady=(0, 4), padx=20, fill="x")
 saved_nicknames = load_nicknames()
-username_entry = ctk.CTkEntry(nickname_row, placeholder_text="Никнейм")
+username_entry = ctk.CTkEntry(nickname_row, placeholder_text="Никнейм", height=24)
 username_entry.pack(side="left", fill="x", expand=True)
 username_entry.insert(0, saved_nicknames[0] if saved_nicknames else "")
-ctk.CTkButton(nickname_row, text="☰", width=32, command=show_nicknames_page).pack(side="left", padx=(6, 0))
+ctk.CTkButton(nickname_row, text="☰", width=28, height=24, command=show_nicknames_page).pack(side="left", padx=(6, 0))
 
 version_button = ctk.CTkButton(
-    home_frame, text="Выберите версию игры...", anchor="w",
+    home_frame, text="Выберите версию игры...", anchor="w", height=24,
     fg_color="#141617", hover_color="#1a1d1f", text_color="#e5e5e5",
     command=show_version_page,
 )
-version_button.pack(pady=(0, 10), padx=25, fill="x")
-status_label = ctk.CTkLabel(home_frame, text="", font=ctk.CTkFont(size=11))
-status_label.pack(pady=(0, 20))
-play_button = ctk.CTkButton(home_frame, text="Играть", command=on_play)
-play_button.pack(pady=(50, 40), padx=25, fill="x")
+version_button.pack(pady=(0, 4), padx=20, fill="x")
+
+activity_card = ctk.CTkFrame(home_frame, fg_color="#141617", corner_radius=10)
+activity_card.pack(pady=(0, 4), padx=20, fill="x")
+
+activity_header = ctk.CTkFrame(activity_card, fg_color="transparent")
+activity_header.pack(fill="x", padx=10, pady=(6, 1))
+ctk.CTkLabel(activity_header, text="Активность за неделю", font=ctk.CTkFont(size=10, weight="bold")).pack(side="left")
+activity_total_label = ctk.CTkLabel(activity_header, text="", font=ctk.CTkFont(size=10), text_color="#9a9a9a")
+activity_total_label.pack(side="right")
+
+bars_row = ctk.CTkFrame(activity_card, fg_color="transparent", height=BAR_HEIGHT)
+bars_row.pack(fill="x", padx=10)
+bars_row.pack_propagate(False)
+
+day_labels_row = ctk.CTkFrame(activity_card, fg_color="transparent", height=12)
+day_labels_row.pack(fill="x", padx=10, pady=(1, 4))
+day_labels_row.pack_propagate(False)
+
+stats_row = ctk.CTkFrame(activity_card, fg_color="transparent")
+stats_row.pack(fill="x", padx=10, pady=(0, 5))
+stat_versions_label = ctk.CTkLabel(stats_row, text="", font=ctk.CTkFont(size=10))
+stat_versions_label.pack(side="left", expand=True)
+stat_time_label = ctk.CTkLabel(stats_row, text="", font=ctk.CTkFont(size=10))
+stat_time_label.pack(side="left", expand=True)
+stat_accounts_label = ctk.CTkLabel(stats_row, text="", font=ctk.CTkFont(size=10))
+stat_accounts_label.pack(side="left", expand=True)
+
+status_label = ctk.CTkLabel(home_frame, text="", font=ctk.CTkFont(size=10))
+status_label.pack(pady=(0, 2))
+play_button = ctk.CTkButton(home_frame, text="Играть", height=28, command=on_play)
+play_button.pack(pady=(0, 8), padx=20, fill="x")
 
 header = ctk.CTkFrame(version_frame, fg_color="transparent")
 header.pack(fill="x", padx=12, pady=(10, 6))
@@ -470,6 +552,7 @@ stop_button = ctk.CTkButton(
 )
 stop_button.pack(fill="x", padx=12, pady=(0, 12))
 
+render_activity_card()
 show_home()
 threading.Thread(target=load_versions, daemon=True).start()
 
